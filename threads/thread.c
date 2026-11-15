@@ -479,6 +479,15 @@ init_thread(struct thread *t, const char *name, int priority)
     t->priority = priority;
     t->magic = THREAD_MAGIC;
 
+#ifdef USERPROG
+    /* The memset() above already cleared cs and exec_file.  The child list
+     * needs real head/tail pointers, and the exit status defaults to -1 so
+     * that a process killed by the kernel reports -1 even though it never
+     * reached the exit syscall. */
+    list_init(&t->children);
+    t->exit_status = -1;
+#endif
+
     old_level = intr_disable();
     list_push_back(&all_list, &t->allelem);
     intr_set_level(old_level);
