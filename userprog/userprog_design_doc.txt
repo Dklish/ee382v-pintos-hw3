@@ -8,8 +8,8 @@
 
 >> Fill in the names and email addresses of your group members.
 
-FirstName LastName <email@utexas.edu>
-FirstName LastName <email@utexas.edu>
+Eduardo Rosales <er36268@eid.utexas.edu>
+Diego Klish <dsk947@eid.utexas.edu>
 
 ---- PRELIMINARIES ----
 
@@ -28,15 +28,34 @@ FirstName LastName <email@utexas.edu>
 >> `struct' member, global or static variable, `typedef', or
 >> enumeration.  Identify the purpose of each in 25 words or less.
 
+In userprog/process.h:
+
+    #define MAX_ARGS 128
+
+Caps the number of command-line words, and sizes the local argv[] array
+that start_process() builds.  Argument passing needed no new struct members.
+
 ---- ALGORITHMS ----
 
 >> A2: Briefly describe how you implemented argument parsing.  How do
 >> you arrange for the elements of argv[] to be in the right order?
 >> How do you avoid overflowing the stack page?
 
+start_process() splits its page copy of the command line in place with
+strtok_r() into a local argv[], then push_args() copies the strings onto the
+user stack last argument first, so argv[0]'s string lands lowest, and writes
+the pointer array in the same descending order so argv[0] is at the lowest
+address.  Before loading we sum the strings, alignment padding, the pointer
+array and the three trailing words, and refuse the command line if the total
+exceeds PGSIZE, since setup_stack() maps only one page.
+
 ---- RATIONALE ----
 
 >> A3: Why does Pintos implement strtok_r() but not strtok()?
+
+strtok() keeps its position in one hidden static variable, so two threads
+tokenizing at once would clobber each other, while strtok_r() takes the save
+pointer as an argument and gives every caller its own.
 
                              SYSTEM CALLS
                              ============
@@ -47,14 +66,47 @@ FirstName LastName <email@utexas.edu>
 >> `struct' member, global or static variable, `typedef', or
 >> enumeration.  Identify the purpose of each in 25 words or less.
 
+Added to struct thread (threads/thread.h):
+
+    struct file *fds[FD_MAX];   /* Open files, indexed by fd. */
+    int exit_status;            /* Status passed to exit(); -1 if killed. */
+    struct child_status *cs;    /* My record, shared with my parent. */
+    struct list children;       /* My children's child_status records. */
+    struct file *exec_file;     /* My executable, held open to deny writes. */
+
+In userprog/syscall.c:
+
+    struct lock filesys_lock;   /* Serializes all file system access. */
+
+In userprog/process.h:
+
+    struct child_status { tid_t tid; int exit_status; bool load_success;
+                          bool waited; int ref_cnt; struct lock ref_lock;
+                          struct semaphore load_sema, wait_sema;
+                          char *cmdline; struct list_elem elem; };
+
+A parent's reference-counted record of one child, carrying its exit status
+and the two semaphores that exec() and wait() block on.
+
 >> B2: Describe how file descriptors are associated with open files.
 >> Are file descriptors unique within the entire OS or just within a
 >> single process?
+
+Each process has a fixed array of struct file * and the fd is simply the
+array index, with open() returning the lowest free slot at or above 2.
+They are per-process, so the same number in two processes refers to
+different files.
 
 ---- ALGORITHMS ----
 
 >> B3: Describe your code for reading and writing user data from the
 >> kernel.
+
+Every user pointer is validated before it is dereferenced: check_ptr()
+kills the process with exit(-1) if the address is NULL, at or above
+PHYS_BASE, or unmapped in the process's page directory.  check_buffer()
+applies that to every page a buffer spans and check_string() to every byte
+up to the NUL, after which the kernel dereferences the pointer directly.
 
 >> B4: Suppose a system call causes a full page (4,096 bytes) of data
 >> to be copied from user space into the kernel.  What is the least
@@ -63,8 +115,20 @@ FirstName LastName <email@utexas.edu>
 >> for a system call that only copies 2 bytes of data?  Is there room
 >> for improvement in these numbers, and how much?
 
+check_buffer() inspects the buffer's start once and then one address per
+page spanned, so a full page costs 2 when page-aligned and 3 when it
+straddles two pages, and 2 bytes costs the same 2 or 3.  There is room for
+improvement: the initial inspection duplicates the loop's first iteration,
+so dropping it would give the theoretical minimum of 1 and 2.
+
 >> B5: Briefly describe your implementation of the "wait" system call
 >> and how it interacts with process termination.
+
+process_wait() finds the tid in the caller's own children list, returns -1
+if it is absent or already waited on, and otherwise blocks on that record's
+wait_sema and returns the stored exit status.  process_exit() stores the
+status and ups wait_sema on the way out, so wait() returns immediately for a
+child that has already died.
 
 >> B6: Any access to user program memory at a user-specified address
 >> can fail due to a bad pointer value.  Such accesses must cause the
@@ -80,12 +144,25 @@ FirstName LastName <email@utexas.edu>
 >> paragraphs, describe the strategy or strategies you adopted for
 >> managing these issues.  Give an example.
 
+All user pointers are validated up front, before any lock is taken or
+memory allocated, so the failure path is a single exit(-1) with nothing to
+unwind and the checks stay out of the main logic.  For example sys_open()
+calls check_string(name) before lock_acquire(&filesys_lock), so a bad
+pointer kills the process while no lock is held; as a backstop sys_exit()
+releases filesys_lock if the dying thread still holds it, and process_exit()
+closes every remaining fd and the executable however the process died.
+
 ---- SYNCHRONIZATION ----
 
 >> B7: The "exec" system call returns -1 if loading the new executable
 >> fails, so it cannot return before the new executable has completed
 >> loading.  How does your code ensure this?  How is the load
 >> success/failure status passed back to the thread that calls "exec"?
+
+process_execute() allocates the child_status, creates the thread, then
+blocks on sema_down(&cs->load_sema).  The child stores the result of load()
+in cs->load_success and ups that semaphore, after which the parent returns
+the tid on success or TID_ERROR on failure.
 
 >> B8: Consider parent process P with child process C.  How do you
 >> ensure proper synchronization and avoid race conditions when P
@@ -94,16 +171,38 @@ FirstName LastName <email@utexas.edu>
 >> terminates without waiting, before C exits?  After C exits?  Are
 >> there any special cases?
 
+The child_status record is reference counted, one reference per side, so it
+outlives whichever of P and C exits first and is freed by the second; P
+waiting early blocks on wait_sema, and P waiting after C exits returns at
+once because C already upped it.  If P exits without waiting it drops its
+reference and C frees the record when it exits, or frees it immediately if C
+is already gone; the one special case is a failed load, where the record is
+never added to P's children list so wait() can never find that child.
+
 ---- RATIONALE ----
 
 >> B9: Why did you choose to implement access to user memory from the
 >> kernel in the way that you did?
 
+We verify pointers with is_user_vaddr() and pagedir_get_page() before
+dereferencing, rather than letting the MMU fault and recovering in
+page_fault(), because the error path stays an ordinary early return and no
+lock or allocation can be stranded.  It is slower than the fault-based
+method but far easier to reason about.
+
 >> B10: What advantages or disadvantages can you see to your design
 >> for file descriptors?
 
+A fixed per-process array gives O(1) lookup and needs no allocation or
+locking to read.  The costs are a hard ceiling of 62 open files per process
+and 256 wasted bytes in every struct thread, including kernel threads that
+never open a file.
+
 >> B11: The default tid_t to pid_t mapping is the identity mapping.
 >> If you changed it, what advantages are there to your approach?
+
+We kept the identity mapping, so exec() returns the child's tid and wait()
+takes it directly with no translation table to keep in sync.
 
                            SURVEY QUESTIONS
                            ================

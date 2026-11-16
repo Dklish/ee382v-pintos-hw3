@@ -479,6 +479,13 @@ init_thread(struct thread *t, const char *name, int priority)
     t->priority = priority;
     t->magic = THREAD_MAGIC;
 
+#ifdef USERPROG
+    /* memset() above cleared cs and exec_file.  The list needs real head and
+     * tail pointers, and -1 is what a kernel-killed process must report. */
+    list_init(&t->children);
+    t->exit_status = -1;
+#endif
+
     old_level = intr_disable();
     list_push_back(&all_list, &t->allelem);
     intr_set_level(old_level);

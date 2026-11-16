@@ -11,12 +11,15 @@
 #include "threads/flags.h"
 #include "threads/init.h"
 #include "threads/interrupt.h"
+#include "threads/malloc.h"
 #include "threads/palloc.h"
+#include "threads/synch.h"
 #include "threads/thread.h"
 #include "threads/vaddr.h"
 #include "userprog/gdt.h"
 #include "userprog/pagedir.h"
 #include "userprog/process.h"
+#include "userprog/syscall.h"
 #include "userprog/tss.h"
 
 #define LOGGING_LEVEL 6
@@ -25,15 +28,45 @@
 
 static thread_func start_process NO_RETURN;
 static bool load(const char *cmdline, void(**eip) (void), void **esp);
+static void push_args(void **esp, int argc, char *argv[]);
+static void first_word(const char *s, char *dst, size_t size);
+static void child_status_release(struct child_status *cs);
 
-/* Starts a new thread running a user program loaded from
- * FILENAME.  The new thread may be scheduled (and may even exit)
- * before process_execute() returns.  Returns the new process's
- * thread id, or TID_ERROR if the thread cannot be created. */
+/* Drops one reference to CS, freeing it once both sides have let go. */
+static void
+child_status_release(struct child_status *cs)
+{
+    bool last;
+
+    lock_acquire(&cs->ref_lock);
+    last = (--cs->ref_cnt == 0);
+    lock_release(&cs->ref_lock);
+    if (last) {
+        free(cs);
+    }
+}
+
+/* Copies the first word of S (the program name) into DST, of SIZE bytes. */
+static void
+first_word(const char *s, char *dst, size_t size)
+{
+    s += strspn(s, " \t");
+    strlcpy(dst, s, size);
+    dst[strcspn(dst, " \t")] = '\0';
+}
+
+/* Starts a user program: the first word of FILE_NAME names the executable,
+ * the rest are its arguments.
+ *
+ * Blocks until the child has tried to load, since exec() must report -1 for
+ * a program that cannot be loaded.  Returns the new process's thread id, or
+ * TID_ERROR if the thread could not be created or the load failed. */
 tid_t
 process_execute(const char *file_name)
 {
-    char *fn_copy;
+    char name[16];
+    char *cmdline;
+    struct child_status *cs;
     tid_t tid;
 
     // NOTE:
@@ -44,40 +77,148 @@ process_execute(const char *file_name)
 
     /* Make a copy of FILE_NAME.
      * Otherwise there's a race between the caller and load(). */
-    fn_copy = palloc_get_page(0);
-    if (fn_copy == NULL) {
+    cmdline = palloc_get_page(0);
+    if (cmdline == NULL) {
         return TID_ERROR;
     }
-    strlcpy(fn_copy, file_name, PGSIZE);
+    strlcpy(cmdline, file_name, PGSIZE);
 
-    /* Create a new thread to execute FILE_NAME. */
-    tid = thread_create(file_name, PRI_DEFAULT, start_process, fn_copy);
-    if (tid == TID_ERROR) {
-        palloc_free_page(fn_copy);
+    /* Name the thread after the program, not the whole command line:
+     * process_exit() prints this name in the exit message. */
+    first_word(cmdline, name, sizeof name);
+
+    cs = malloc(sizeof *cs);
+    if (cs == NULL) {
+        palloc_free_page(cmdline);
+        return TID_ERROR;
     }
+    cs->tid = TID_ERROR;
+    cs->exit_status = -1;
+    cs->load_success = false;
+    cs->waited = false;
+    cs->ref_cnt = 2;                     /* this parent, plus the child */
+    lock_init(&cs->ref_lock);
+    sema_init(&cs->load_sema, 0);
+    sema_init(&cs->wait_sema, 0);
+    cs->cmdline = cmdline;
+
+    tid = thread_create(name, PRI_DEFAULT, start_process, cs);
+    if (tid == TID_ERROR) {
+        palloc_free_page(cmdline);
+        free(cs);               /* the child never ran, so never took a ref */
+        return TID_ERROR;
+    }
+    cs->tid = tid;
+
+    sema_down(&cs->load_sema);
+    if (!cs->load_success) {
+        /* Not recorded as a child, so wait() can never find it. */
+        child_status_release(cs);
+        return TID_ERROR;
+    }
+
+    list_push_back(&thread_current()->children, &cs->elem);
     return tid;
+}
+
+/* Builds the initial user stack, following the 80x86 calling convention in
+ * userprog/README.md ("Program Startup Details").  Clobbers ARGV[i] with
+ * the address its string landed at. */
+static void
+push_args(void **esp, int argc, char *argv[])
+{
+    uint8_t *sp = *esp;
+    uint32_t *w, *base;
+    int i;
+
+    /* Strings last-first, so argv[0]'s lands lowest, then word-align. */
+    for (i = argc - 1; i >= 0; i--) {
+        size_t n = strlen(argv[i]) + 1;
+        sp -= n;
+        memcpy(sp, argv[i], n);
+        argv[i] = (char *)sp;
+    }
+    sp -= (uintptr_t)sp % 4;
+
+    w = (uint32_t *)sp;
+    *--w = 0;                           /* argv[argc]: null sentinel */
+    for (i = argc - 1; i >= 0; i--) {
+        *--w = (uintptr_t)argv[i];      /* argv[i] */
+    }
+    base = w;
+    *--w = (uintptr_t)base;             /* argv */
+    *--w = argc;
+    *--w = 0;                           /* fake return address */
+
+    *esp = w;
 }
 
 /* A thread function that loads a user process and starts it
  * running. */
 static void
-start_process(void *file_name_)
+start_process(void *cs_)
 {
-    char *file_name = file_name_;
+    struct child_status *cs = cs_;
+    char *cmdline = cs->cmdline;
+    char *argv[MAX_ARGS];
+    char *token, *saveptr;
+    int argc = 0;
+    size_t bytes;
+    bool ok;
+    int i;
     struct intr_frame if_;
     bool success;
 
     log(L_TRACE, "start_process()");
+
+    /* Take our reference to the record the parent allocated for us. */
+    thread_current()->cs = cs;
+    cs->cmdline = NULL;
+
+    /* Split the command line in place; strtok_r() collapses runs of
+     * separators, so "a  b" yields the same two words as "a b".  argv[]
+     * points into the page, which lives until push_args() has copied the
+     * strings onto the user stack. */
+    ok = true;
+    for (token = strtok_r(cmdline, " \t", &saveptr); token != NULL;
+         token = strtok_r(NULL, " \t", &saveptr)) {
+        if (argc == MAX_ARGS) {
+            ok = false;
+            break;
+        }
+        argv[argc++] = token;
+    }
+
+    /* setup_stack() maps one page, so refuse a command line whose argument
+     * block would not fit rather than let push_args() run off the end.
+     * Counts strings, 3 bytes of padding, argv[0..argc], and the words for
+     * argv, argc and the return address. */
+    bytes = (argc + 1) * sizeof(char *) + 3 * sizeof(uint32_t) + 3;
+    for (i = 0; i < argc; i++) {
+        bytes += strlen(argv[i]) + 1;
+    }
+    if (bytes > PGSIZE) {
+        ok = false;
+    }
 
     /* Initialize interrupt frame and load executable. */
     memset(&if_, 0, sizeof if_);
     if_.gs = if_.fs = if_.es = if_.ds = if_.ss = SEL_UDSEG;
     if_.cs = SEL_UCSEG;
     if_.eflags = FLAG_IF | FLAG_MBS;
-    success = load(file_name, &if_.eip, &if_.esp);
+    success = ok && argc > 0 && load(argv[0], &if_.eip, &if_.esp);
+    if (success) {
+        push_args(&if_.esp, argc, argv);
+    }
+
+    palloc_free_page(cmdline);
+
+    /* Release the parent, which is blocked in process_execute() waiting to
+     * learn whether we loaded. */
+    cs->load_success = success;
+    sema_up(&cs->load_sema);
 
     /* If load failed, quit. */
-    palloc_free_page(file_name);
     if (!success) {
         thread_exit();
     }
@@ -97,14 +238,36 @@ start_process(void *file_name_)
  * exception), returns -1.  If TID is invalid or if it was not a
  * child of the calling process, or if process_wait() has already
  * been successfully called for the given TID, returns -1
- * immediately, without waiting.
- *
- * This function will be implemented in problem 2-2.  For now, it
- * does nothing. */
+ * immediately, without waiting. */
 int
-process_wait(tid_t child_tid UNUSED)
+process_wait(tid_t child_tid)
 {
-    return -1;
+    struct thread *cur = thread_current();
+    struct child_status *cs = NULL;
+    struct list_elem *e;
+    int status;
+
+    /* Searching our own list, not all threads, is what makes wait() on a
+     * grandchild fail. */
+    for (e = list_begin(&cur->children); e != list_end(&cur->children);
+         e = list_next(e)) {
+        struct child_status *c = list_entry(e, struct child_status, elem);
+        if (c->tid == child_tid) {
+            cs = c;
+            break;
+        }
+    }
+    if (cs == NULL || cs->waited) {
+        return -1;              /* not our child, or waited for already */
+    }
+    cs->waited = true;
+
+    sema_down(&cs->wait_sema);  /* returns at once if it already exited */
+    status = cs->exit_status;
+
+    list_remove(&cs->elem);     /* a child may be waited for only once */
+    child_status_release(cs);
+    return status;
 }
 
 /* Free the current process's resources. */
@@ -113,6 +276,43 @@ process_exit(void)
 {
     struct thread *cur = thread_current();
     uint32_t *pd;
+    int fd;
+
+    /* Close every file, however we got here: sys_exit() does this for a
+     * process that called exit(), but kill() in exception.c reaches
+     * thread_exit() directly.  Already-closed entries are NULL.  Closing
+     * the executable re-allows writes to it. */
+    lock_acquire(&filesys_lock);
+    for (fd = 2; fd < FD_MAX; fd++) {
+        if (cur->fds[fd] != NULL) {
+            file_close(cur->fds[fd]);
+            cur->fds[fd] = NULL;
+        }
+    }
+    if (cur->exec_file != NULL) {
+        file_close(cur->exec_file);
+        cur->exec_file = NULL;
+    }
+    lock_release(&filesys_lock);
+
+    /* Release our children's records.  A child still running holds its own
+     * reference, so its record survives: that is how orphans work. */
+    while (!list_empty(&cur->children)) {
+        struct child_status *c = list_entry(list_pop_front(&cur->children),
+                                            struct child_status, elem);
+        child_status_release(c);
+    }
+
+    /* Report the exit and hand the status to our parent.  Only processes
+     * from process_execute() have a record, so kernel threads print
+     * nothing, and halt() never reaches here. */
+    if (cur->cs != NULL) {
+        printf("%s: exit(%d)\n", cur->name, cur->exit_status);
+        cur->cs->exit_status = cur->exit_status;
+        sema_up(&cur->cs->wait_sema);   /* only after storing the status */
+        child_status_release(cur->cs);
+        cur->cs = NULL;
+    }
 
     /* Destroy the current process's page directory and switch back
      * to the kernel-only page directory. */
@@ -228,6 +428,11 @@ load(const char *file_name, void(**eip) (void), void **esp)
     bool success = false;
     int i;
 
+    /* The provided file system has no internal synchronization, so hold the
+     * same lock the syscalls use.  Held across the whole function so every
+     * `goto done' unlocks. */
+    lock_acquire(&filesys_lock);
+
     /* Allocate and activate page directory. */
     t->pagedir = pagedir_create();
     if (t->pagedir == NULL) {
@@ -241,6 +446,11 @@ load(const char *file_name, void(**eip) (void), void **esp)
         printf("load: %s: open failed\n", file_name);
         goto done;
     }
+
+    /* Hold the executable open with writes denied for as long as we run, so
+     * nobody can modify code we are executing; process_exit() closes it. */
+    file_deny_write(file);
+    t->exec_file = file;
 
     /* Read and verify executable header. */
     if (file_read(file, &ehdr, sizeof ehdr) != sizeof ehdr
@@ -321,8 +531,13 @@ load(const char *file_name, void(**eip) (void), void **esp)
     success = true;
 
 done:
-    /* We arrive here whether the load is successful or not. */
-    file_close(file);
+    /* Reached whether or not the load worked.  On success the executable
+     * stays open as t->exec_file; only a failure closes it here. */
+    if (!success) {
+        file_close(file);
+        t->exec_file = NULL;
+    }
+    lock_release(&filesys_lock);
     return success;
 }
 
