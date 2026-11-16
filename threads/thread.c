@@ -480,10 +480,8 @@ init_thread(struct thread *t, const char *name, int priority)
     t->magic = THREAD_MAGIC;
 
 #ifdef USERPROG
-    /* The memset() above already cleared cs and exec_file.  The child list
-     * needs real head/tail pointers, and the exit status defaults to -1 so
-     * that a process killed by the kernel reports -1 even though it never
-     * reached the exit syscall. */
+    /* memset() above cleared cs and exec_file.  The list needs real head and
+     * tail pointers, and -1 is what a kernel-killed process must report. */
     list_init(&t->children);
     t->exit_status = -1;
 #endif

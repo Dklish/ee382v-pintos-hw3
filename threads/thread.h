@@ -101,13 +101,10 @@ struct thread {
     uint32_t *pagedir; /* Page directory. */
     struct file *fds[FD_MAX]; /* Open files, indexed by fd. */
     int          exit_status; /* Status passed to exit(). */
-    struct child_status *cs;  /* My own record, shared with my parent.
-                                 NULL for kernel threads, which is how
-                                 process_exit() knows not to print an
-                                 exit message for them. */
-    struct list   children;   /* child_status records for my children. */
-    struct file  *exec_file;  /* My executable, held open while I run so
-                                 that writes to it stay denied. */
+    struct child_status *cs;  /* My record, shared with my parent; NULL for
+                                 kernel threads, which get no exit message. */
+    struct list   children;   /* My children's child_status records. */
+    struct file  *exec_file;  /* My executable, held open to deny writes. */
 #endif
 
     /* Owned by thread.c. */

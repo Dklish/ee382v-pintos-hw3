@@ -32,8 +32,7 @@ static void push_args(void **esp, int argc, char *argv[]);
 static void first_word(const char *s, char *dst, size_t size);
 static void child_status_release(struct child_status *cs);
 
-/* Drops one reference to CS, freeing it once both the parent and the child
- * have let go of it.  Either side may be the last one. */
+/* Drops one reference to CS, freeing it once both sides have let go. */
 static void
 child_status_release(struct child_status *cs)
 {
@@ -47,32 +46,21 @@ child_status_release(struct child_status *cs)
     }
 }
 
-/* Copies the first whitespace-delimited word of S into DST, which holds
- * SIZE bytes.  Used to name the thread after the program rather than the
- * whole command line, so that the exit message prints just the program
- * name as the spec requires. */
+/* Copies the first word of S (the program name) into DST, of SIZE bytes. */
 static void
 first_word(const char *s, char *dst, size_t size)
 {
-    size_t i = 0;
-
-    while (*s == ' ' || *s == '\t') {
-        s++;
-    }
-    while (s[i] != '\0' && s[i] != ' ' && s[i] != '\t' && i + 1 < size) {
-        dst[i] = s[i];
-        i++;
-    }
-    dst[i] = '\0';
+    s += strspn(s, " \t");
+    strlcpy(dst, s, size);
+    dst[strcspn(dst, " \t")] = '\0';
 }
 
-/* Starts a new thread running the user program named by the first word of
- * FILE_NAME, passing it the remaining words as arguments.
+/* Starts a user program: the first word of FILE_NAME names the executable,
+ * the rest are its arguments.
  *
- * Does not return until the child has tried to load its executable, because
- * exec() has to report -1 when the program cannot be loaded.  Returns the
- * new process's thread id, or TID_ERROR if the thread could not be created
- * or the executable did not load. */
+ * Blocks until the child has tried to load, since exec() must report -1 for
+ * a program that cannot be loaded.  Returns the new process's thread id, or
+ * TID_ERROR if the thread could not be created or the load failed. */
 tid_t
 process_execute(const char *file_name)
 {
@@ -95,8 +83,8 @@ process_execute(const char *file_name)
     }
     strlcpy(cmdline, file_name, PGSIZE);
 
-    /* Name the thread after the program, not the whole command line: this
-     * is the name process_exit() prints in the exit message. */
+    /* Name the thread after the program, not the whole command line:
+     * process_exit() prints this name in the exit message. */
     first_word(cmdline, name, sizeof name);
 
     cs = malloc(sizeof *cs);
@@ -116,19 +104,15 @@ process_execute(const char *file_name)
 
     tid = thread_create(name, PRI_DEFAULT, start_process, cs);
     if (tid == TID_ERROR) {
-        /* The child never ran, so it never took its reference. */
         palloc_free_page(cmdline);
-        free(cs);
+        free(cs);               /* the child never ran, so never took a ref */
         return TID_ERROR;
     }
     cs->tid = tid;
 
-    /* Block until the child has finished loading.  We must not return a pid
-     * to exec() before we know the executable is actually running. */
     sema_down(&cs->load_sema);
     if (!cs->load_success) {
-        /* The child is on its way out; let go of our reference and don't
-         * record it as a child, so wait() can never find it. */
+        /* Not recorded as a child, so wait() can never find it. */
         child_status_release(cs);
         return TID_ERROR;
     }
@@ -137,54 +121,36 @@ process_execute(const char *file_name)
     return tid;
 }
 
-/* Builds the initial user stack: the argument strings, the argv[] array
- * pointing at them, argv, argc, and a fake return address.  The order and
- * alignment follow the 80x86 calling convention laid out in
- * userprog/README.md ("Program Startup Details").
- *
- * Overwrites ARGV[i] with the address the string ended up at, which the
- * caller no longer needs. */
+/* Builds the initial user stack, following the 80x86 calling convention in
+ * userprog/README.md ("Program Startup Details").  Clobbers ARGV[i] with
+ * the address its string landed at. */
 static void
 push_args(void **esp, int argc, char *argv[])
 {
     uint8_t *sp = *esp;
-    char **slot;
+    uint32_t *w, *base;
     int i;
 
-    /* The strings, last argument first, so argv[0]'s string ends up at the
-     * lowest address of the block. */
+    /* Strings last-first, so argv[0]'s lands lowest, then word-align. */
     for (i = argc - 1; i >= 0; i--) {
-        size_t size = strlen(argv[i]) + 1;
-        sp -= size;
-        memcpy(sp, argv[i], size);
+        size_t n = strlen(argv[i]) + 1;
+        sp -= n;
+        memcpy(sp, argv[i], n);
         argv[i] = (char *)sp;
     }
-
-    /* Round down to a multiple of 4: aligned accesses are faster. */
     sp -= (uintptr_t)sp % 4;
 
-    /* argv[argc] is a null sentinel, so that argv[argc] == NULL as C
-     * requires, then argv[argc-1] down to argv[0]. */
-    slot = (char **)sp;
-    slot--;
-    *slot = NULL;
+    w = (uint32_t *)sp;
+    *--w = 0;                           /* argv[argc]: null sentinel */
     for (i = argc - 1; i >= 0; i--) {
-        slot--;
-        *slot = argv[i];
+        *--w = (uintptr_t)argv[i];      /* argv[i] */
     }
+    base = w;
+    *--w = (uintptr_t)base;             /* argv */
+    *--w = argc;
+    *--w = 0;                           /* fake return address */
 
-    /* argv (the address of argv[0]), then argc, then a fake return address:
-     * the entry function never returns, but its frame has to look like
-     * every other frame. */
-    sp = (uint8_t *)slot;
-    sp -= sizeof(char **);
-    *(char ***)sp = slot;
-    sp -= sizeof(int);
-    *(int *)sp = argc;
-    sp -= sizeof(void *);
-    *(void **)sp = NULL;
-
-    *esp = sp;
+    *esp = w;
 }
 
 /* A thread function that loads a user process and starts it
@@ -205,30 +171,28 @@ start_process(void *cs_)
 
     log(L_TRACE, "start_process()");
 
-    /* Take our reference to the record our parent allocated for us. */
+    /* Take our reference to the record the parent allocated for us. */
     thread_current()->cs = cs;
     cs->cmdline = NULL;
 
-    /* Split the command line in place.  strtok_r() collapses runs of
-     * separators, so "a  b" gives the same two words as "a b".  The argv[]
-     * entries point into the command line page, which stays alive until
-     * after push_args() has copied the strings onto the user stack. */
+    /* Split the command line in place; strtok_r() collapses runs of
+     * separators, so "a  b" yields the same two words as "a b".  argv[]
+     * points into the page, which lives until push_args() has copied the
+     * strings onto the user stack. */
     ok = true;
     for (token = strtok_r(cmdline, " \t", &saveptr); token != NULL;
          token = strtok_r(NULL, " \t", &saveptr)) {
         if (argc == MAX_ARGS) {
-            ok = false;             /* too many words to pass faithfully */
+            ok = false;
             break;
         }
         argv[argc++] = token;
     }
 
-    /* setup_stack() maps exactly one page, so the argument block has to fit
-     * in it or push_args() would write off the end.  The spec allows capping
-     * the arguments at a single page, so refuse to run rather than scribble
-     * past the stack.  Counted: the strings, up to 3 bytes of alignment
-     * padding, argv[0..argc] including the null sentinel, and the three
-     * words for argv, argc and the fake return address. */
+    /* setup_stack() maps one page, so refuse a command line whose argument
+     * block would not fit rather than let push_args() run off the end.
+     * Counts strings, 3 bytes of padding, argv[0..argc], and the words for
+     * argv, argc and the return address. */
     bytes = (argc + 1) * sizeof(char *) + 3 * sizeof(uint32_t) + 3;
     for (i = 0; i < argc; i++) {
         bytes += strlen(argv[i]) + 1;
@@ -249,9 +213,8 @@ start_process(void *cs_)
 
     palloc_free_page(cmdline);
 
-    /* Release our parent from process_execute(), which is blocked waiting to
-     * learn whether we loaded.  Nothing above may touch the user stack after
-     * this point without the load having succeeded. */
+    /* Release the parent, which is blocked in process_execute() waiting to
+     * learn whether we loaded. */
     cs->load_success = success;
     sema_up(&cs->load_sema);
 
@@ -284,8 +247,8 @@ process_wait(tid_t child_tid)
     struct list_elem *e;
     int status;
 
-    /* Only a direct child counts, so look in our own list rather than at
-     * every thread: that is what makes wait() on a grandchild fail. */
+    /* Searching our own list, not all threads, is what makes wait() on a
+     * grandchild fail. */
     for (e = list_begin(&cur->children); e != list_end(&cur->children);
          e = list_next(e)) {
         struct child_status *c = list_entry(e, struct child_status, elem);
@@ -299,13 +262,10 @@ process_wait(tid_t child_tid)
     }
     cs->waited = true;
 
-    /* Returns at once if the child has already exited, since its exit
-     * up'd this semaphore on the way out. */
-    sema_down(&cs->wait_sema);
+    sema_down(&cs->wait_sema);  /* returns at once if it already exited */
     status = cs->exit_status;
 
-    /* A child may be waited for only once, so drop the record now. */
-    list_remove(&cs->elem);
+    list_remove(&cs->elem);     /* a child may be waited for only once */
     child_status_release(cs);
     return status;
 }
@@ -318,14 +278,10 @@ process_exit(void)
     uint32_t *pd;
     int fd;
 
-    /* Terminating a process closes all of its open files, whichever way it
-     * terminated.  sys_exit() already does this for a process that called
-     * exit(), but kill() in exception.c reaches thread_exit() directly, so
-     * doing it here too is what makes the cleanup unconditional.  Entries
-     * sys_exit() already closed are NULL, so this is a no-op for them.
-     *
-     * Closing the executable re-allows writes to it (file_close() calls
-     * file_allow_write()), which is why we held it open all this time. */
+    /* Close every file, however we got here: sys_exit() does this for a
+     * process that called exit(), but kill() in exception.c reaches
+     * thread_exit() directly.  Already-closed entries are NULL.  Closing
+     * the executable re-allows writes to it. */
     lock_acquire(&filesys_lock);
     for (fd = 2; fd < FD_MAX; fd++) {
         if (cur->fds[fd] != NULL) {
@@ -339,22 +295,21 @@ process_exit(void)
     }
     lock_release(&filesys_lock);
 
-    /* Let go of every child record we still hold.  A child that is still
-     * running keeps its own reference, so the record lives until it exits;
-     * this is how orphans are handled without being reassigned a parent. */
+    /* Release our children's records.  A child still running holds its own
+     * reference, so its record survives: that is how orphans work. */
     while (!list_empty(&cur->children)) {
         struct child_status *c = list_entry(list_pop_front(&cur->children),
                                             struct child_status, elem);
         child_status_release(c);
     }
 
-    /* Report the exit and hand our status to our parent.  Only processes
-     * started by process_execute() have a record, so plain kernel threads
-     * print nothing, and halt() never gets here at all. */
+    /* Report the exit and hand the status to our parent.  Only processes
+     * from process_execute() have a record, so kernel threads print
+     * nothing, and halt() never reaches here. */
     if (cur->cs != NULL) {
         printf("%s: exit(%d)\n", cur->name, cur->exit_status);
         cur->cs->exit_status = cur->exit_status;
-        sema_up(&cur->cs->wait_sema);   /* only after the status is stored */
+        sema_up(&cur->cs->wait_sema);   /* only after storing the status */
         child_status_release(cur->cs);
         cur->cs = NULL;
     }
@@ -473,9 +428,9 @@ load(const char *file_name, void(**eip) (void), void **esp)
     bool success = false;
     int i;
 
-    /* Loading reads the file system, and the provided file system has no
-     * internal synchronization, so hold the same lock the syscalls use.
-     * Held across the whole function so that every `goto done' unlocks. */
+    /* The provided file system has no internal synchronization, so hold the
+     * same lock the syscalls use.  Held across the whole function so every
+     * `goto done' unlocks. */
     lock_acquire(&filesys_lock);
 
     /* Allocate and activate page directory. */
@@ -492,9 +447,8 @@ load(const char *file_name, void(**eip) (void), void **esp)
         goto done;
     }
 
-    /* Keep the executable open for as long as this process runs, with
-     * writes denied, so nobody can modify the code we are executing.
-     * process_exit() closes it, which re-allows writes. */
+    /* Hold the executable open with writes denied for as long as we run, so
+     * nobody can modify code we are executing; process_exit() closes it. */
     file_deny_write(file);
     t->exec_file = file;
 
@@ -577,9 +531,8 @@ load(const char *file_name, void(**eip) (void), void **esp)
     success = true;
 
 done:
-    /* We arrive here whether the load is successful or not.  On success the
-     * executable deliberately stays open as t->exec_file; only a failed load
-     * closes it here. */
+    /* Reached whether or not the load worked.  On success the executable
+     * stays open as t->exec_file; only a failure closes it here. */
     if (!success) {
         file_close(file);
         t->exec_file = NULL;
